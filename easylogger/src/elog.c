@@ -1,7 +1,7 @@
 /*
  * This file is part of the EasyLogger Library.
  *
- * Copyright (c) 2015-2017, Armink, <armink.ztl@gmail.com>
+ * Copyright (c) 2015-2018, Armink, <armink.ztl@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -404,7 +404,6 @@ void elog_output(uint8_t level, const char *tag, const char *file, const char *f
     if (level > elog.filter.level) {
         return;
     } else if (!strstr(tag, elog.filter.tag)) { /* tag filter */
-        //TODO 可以考虑采用KMP及朴素模式匹配字符串，提升性能
         return;
     }
     /* args point to the first variable parameter */
@@ -478,40 +477,58 @@ void elog_output(uint8_t level, const char *tag, const char *file, const char *f
         }
         /* package thread info */
         if (get_fmt_enabled(level, ELOG_FMT_LINE)) {
-            //TODO snprintf资源占用可能较高，待优化
             snprintf(line_num, ELOG_LINE_NUM_MAX_LEN, "%ld", line);
             log_len += elog_strcpy(log_len, log_buf + log_len, line_num);
         }
         log_len += elog_strcpy(log_len, log_buf + log_len, ")");
     }
     /* package other log data to buffer. '\0' must be added in the end by vsnprintf. */
-    fmt_result = vsnprintf(log_buf + log_len, ELOG_LINE_BUF_SIZE - log_len - newline_len + 1, format, args);
+    fmt_result = vsnprintf(log_buf + log_len, ELOG_LINE_BUF_SIZE - log_len, format, args);
 
     va_end(args);
+    /* calculate log length */
+    if ((log_len + fmt_result <= ELOG_LINE_BUF_SIZE) && (fmt_result > -1)) {
+        log_len += fmt_result;
+    } else {
+        /* using max length */
+        log_len = ELOG_LINE_BUF_SIZE;
+    }
+    /* overflow check and reserve some space for CSI end sign and newline sign */
+#ifdef ELOG_COLOR_ENABLE
+    if (log_len + (sizeof(CSI_END) - 1) + newline_len > ELOG_LINE_BUF_SIZE) {
+        /* using max length */
+        log_len = ELOG_LINE_BUF_SIZE;
+        /* reserve some space for CSI end sign */
+        log_len -= (sizeof(CSI_END) - 1);
+#else
+    if (log_len + newline_len > ELOG_LINE_BUF_SIZE) {
+        /* using max length */
+        log_len = ELOG_LINE_BUF_SIZE;
+#endif /* ELOG_COLOR_ENABLE */
+        /* reserve some space for newline sign */
+        log_len -= newline_len;
+    }
+    /* keyword filter */
+    if (elog.filter.keyword[0] != '\0') {
+        /* add string end sign */
+        log_buf[log_len] = '\0';
+        /* find the keyword */
+        if (!strstr(log_buf, elog.filter.keyword)) {
+            /* unlock output */
+            elog_output_unlock();
+            return;
+        }
+    }
 
 #ifdef ELOG_COLOR_ENABLE
     /* add CSI end sign */
     if (elog.text_color_enabled) {
-        log_len += elog_strcpy(log_len, log_buf + log_len + fmt_result, CSI_END);
+        log_len += elog_strcpy(log_len, log_buf + log_len, CSI_END);
     }
 #endif
 
-    /* keyword filter */
-    if (!strstr(log_buf, elog.filter.keyword)) {
-        //TODO 可以考虑采用KMP及朴素模式匹配字符串，提升性能
-        /* unlock output */
-        elog_output_unlock();
-        return;
-    }
     /* package newline sign */
-    if ((fmt_result > -1) && (fmt_result + log_len + newline_len <= ELOG_LINE_BUF_SIZE)) {
-        log_len += fmt_result;
-        log_len += elog_strcpy(log_len, log_buf + log_len, ELOG_NEWLINE_SIGN);
-    } else {
-        log_len = ELOG_LINE_BUF_SIZE;
-        /* copy newline sign */
-        strcpy(log_buf + ELOG_LINE_BUF_SIZE - newline_len, ELOG_NEWLINE_SIGN);
-    }
+    log_len += elog_strcpy(log_len, log_buf + log_len, ELOG_NEWLINE_SIGN);
     /* output log */
 #if defined(ELOG_ASYNC_OUTPUT_ENABLE)
     extern void elog_async_output(uint8_t level, const char *log, size_t size);
@@ -647,4 +664,85 @@ const char *elog_find_tag(const char *log, uint8_t lvl, size_t *tag_len) {
     }
 
     return tag;
+}
+
+/**
+ * dump the hex format data to log
+ *
+ * @param name name for hex object, it will show on log header
+ * @param width hex number for every line, such as: 16, 32
+ * @param buf hex buffer
+ * @param size buffer size
+ */
+void elog_hexdump(const char *name, uint8_t width, uint8_t *buf, uint16_t size)
+{
+#define __is_print(ch)       ((unsigned int)((ch) - ' ') < 127u - ' ')
+
+    uint16_t i, j;
+    uint16_t log_len = 0;
+    char dump_string[8] = {0};
+    int fmt_result;
+
+    if (!elog.output_enabled) {
+        return;
+    }
+
+    /* level filter */
+    if (ELOG_LVL_DEBUG > elog.filter.level) {
+        return;
+    } else if (!strstr(name, elog.filter.tag)) { /* tag filter */
+        return;
+    }
+ 
+    /* lock output */
+    elog_output_lock();
+
+    for (i = 0; i < size; i += width) {
+        /* package header */
+        fmt_result = snprintf(log_buf, ELOG_LINE_BUF_SIZE, "D/HEX %s: %04X-%04X: ", name, i, i + width - 1);
+        /* calculate log length */
+        if ((fmt_result > -1) && (fmt_result <= ELOG_LINE_BUF_SIZE)) {
+            log_len = fmt_result;
+        } else {
+            log_len = ELOG_LINE_BUF_SIZE;
+        }
+        /* dump hex */
+        for (j = 0; j < width; j++) {
+            if (i + j < size) {
+                snprintf(dump_string, sizeof(dump_string), "%02X ", buf[i + j]);
+            } else {
+                strncpy(dump_string, "   ", sizeof(dump_string));
+            }
+            log_len += elog_strcpy(log_len, log_buf + log_len, dump_string);
+            if ((j + 1) % 8 == 0) {
+                log_len += elog_strcpy(log_len, log_buf + log_len, " ");
+            }
+        }
+        log_len += elog_strcpy(log_len, log_buf + log_len, "  ");
+        /* dump char for hex */
+        for (j = 0; j < width; j++) {
+            if (i + j < size) {
+                snprintf(dump_string, sizeof(dump_string), "%c", __is_print(buf[i + j]) ? buf[i + j] : '.');
+                log_len += elog_strcpy(log_len, log_buf + log_len, dump_string);
+            }
+        }
+        /* overflow check and reserve some space for newline sign */
+        if (log_len + strlen(ELOG_NEWLINE_SIGN) > ELOG_LINE_BUF_SIZE) {
+            log_len = ELOG_LINE_BUF_SIZE - strlen(ELOG_NEWLINE_SIGN);
+        }
+        /* package newline sign */
+        log_len += elog_strcpy(log_len, log_buf + log_len, ELOG_NEWLINE_SIGN);
+        /* do log output */
+#if defined(ELOG_ASYNC_OUTPUT_ENABLE)
+        extern void elog_async_output(uint8_t level, const char *log, size_t size);
+        elog_async_output(ELOG_LVL_DEBUG, log_buf, log_len);
+#elif defined(ELOG_BUF_OUTPUT_ENABLE)
+        extern void elog_buf_output(const char *log, size_t size);
+    elog_buf_output(log_buf, log_len);
+#else
+        elog_port_output(log_buf, log_len);
+#endif
+    }
+    /* unlock output */
+    elog_output_unlock();
 }
